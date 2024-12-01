@@ -3,6 +3,10 @@ pragma solidity ^0.8.0;
 
 contract ReputationStateMachine {
 
+    function test() public pure returns (uint256) {
+        return 1;
+    }
+
     /******************************************************************** */
     /*                                                                    */
     /*                              States                                */
