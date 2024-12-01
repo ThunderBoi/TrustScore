@@ -7,14 +7,14 @@ async function main() {
     const reputationContract = (await ReputationStateMachineFactory.deploy()) as ReputationStateMachine;
 
     // Wait for the deployment transaction to complete
-    const deploymentTransaction = reputationContract.deploymentTransaction();
-    if (deploymentTransaction) {
-        await deploymentTransaction.wait();
+    const deployTransaction = reputationContract.deployTransaction;
+    if (deployTransaction) {
+        await deployTransaction.wait();
     } else {
         throw new Error("Deployment transaction is null");
     }
     // Log the deployed contract's address
-    console.log("ReputationStateMachine deployed to:", reputationContract.target);
+    console.log("ReputationStateMachine deployed to:", reputationContract.address);
 }
 
 // Run the script
