@@ -15,6 +15,13 @@ contract ReputationStateMachine {
     // States of the transaction
     enum State { Pending, Shipping, Delivered, Cancelled }
 
+    event DebugUser(bool exists, address user);
+
+    event OfferDeleted(uint256 offerID, address seller);
+
+    event DebugOfferDeletion(uint256 offerID, uint256 allOffersLength);
+
+
     // Delivery states
     enum DeliveryState { Shipped, NotShippedMissingData, NotShippedDeliveryProblem }
     /******************************************************************** */
@@ -39,7 +46,7 @@ contract ReputationStateMachine {
 
     // Struct to store user reputation
     struct UserProfile {
-        uint score;
+        uint256 score;
         bool exists;
         bool isMarketplace;
         bool authenticated; //TBD using DID
@@ -65,8 +72,8 @@ contract ReputationStateMachine {
     // Mapping to store user reputation by their wallet address
     mapping(address => UserProfile) private users;
 
-    // Mapping to store offers for each user
-    mapping(address => Offer[]) private addressToOffers;
+    mapping(uint256 => bool) private validOfferIDs;
+
 
     // Array to store all registered user addresses
     address[] private userAddresses;
@@ -78,7 +85,6 @@ contract ReputationStateMachine {
     mapping(uint256 => Transaction) public transactions; // Map transaction IDs to transactions
     mapping(address => UserProfile) public reputations; // Map addresses to reputation scores
 
-    uint256 public offerCount;
     uint256 public transactionCount;
     /******************************************************************** */
     /*                                                                    */
@@ -116,9 +122,14 @@ contract ReputationStateMachine {
     /******************************************************************** */
 
     function registerUser(bool isMarketplace) public {
+        emit DebugUser(users[msg.sender].exists, msg.sender);
         require(!users[msg.sender].exists, "User already registered");
         users[msg.sender] = UserProfile(0, true, isMarketplace, true, 0);
-        userAddresses.push(msg.sender); // Add user address to the list
+        userAddresses.push(msg.sender);
+    }
+
+    function isUserRegistered(address user) public view returns (bool) {
+        return users[user].exists;
     }
 
     // Function to get the full list of registered users
@@ -144,12 +155,49 @@ contract ReputationStateMachine {
         return users[userAddress].score;
     }
 
+    
+    // Function to get all offers
+    function getFilteredOffers() public view returns (Offer[] memory) {
+        uint count = 0;
+
+        // Create a temporary array to hold filtered offers
+        Offer[] memory tempOffers = new Offer[](allOffers.length);
+
+        if (users[msg.sender].isMarketplace) {
+            // For marketplaces, return offers where buyerAccept is true
+            for (uint i = 0; i < allOffers.length; i++) {
+                if (allOffers[i].buyerAccept) {
+                    tempOffers[count] = allOffers[i];
+                    count++;
+                }
+            }
+        } else {
+            // For non-marketplaces, return offers where the caller is the seller or buyerAccept is false
+            for (uint i = 0; i < allOffers.length; i++) {
+                if (allOffers[i].seller == msg.sender || !allOffers[i].buyerAccept) {
+                    tempOffers[count] = allOffers[i];
+                    count++;
+                }
+            }
+        }
+
+        // Resize the array to include only the filtered offers
+        Offer[] memory filteredOffers = new Offer[](count);
+        for (uint i = 0; i < count; i++) {
+            filteredOffers[i] = tempOffers[i];
+        }
+
+        return filteredOffers;
+    }
+
+
     // Function to create an offer
     function createOffer(string memory item, uint256 price, string memory description) public {
         require(users[msg.sender].exists, "User must be registered to create an offer");
-        offerCount++;
+        require(bytes(item).length > 0, "Item name cannot be empty");
+        require(bytes(description).length > 0, "Description cannot be empty");
         Offer memory newOffer = Offer({
-            offerID: offerCount,
+            offerID: allOffers.length,
             item: item,
             price: price,
             description: description,
@@ -158,21 +206,22 @@ contract ReputationStateMachine {
             buyerAccept: false
         });
 
-        addressToOffers[msg.sender].push(newOffer);
         allOffers.push(newOffer);
-
         emit OfferCreated(msg.sender, item, price, description);
     }
 
-    function acceptOffer(uint256 offerID) public view {
+
+    function acceptOffer(uint256 offerID) public {
         require(offerID < allOffers.length, "Invalid offer ID");
-        Offer memory offerToAccept = allOffers[offerID];
+        Offer storage offerToAccept = allOffers[offerID];
         offerToAccept.buyerAccept = true;
         offerToAccept.buyer = msg.sender;
     }
 
+
     function deleteOffer(uint256 offerID) public {
-        require(offerID < allOffers.length, "Invalid offer ID");
+        require(allOffers.length > 0, "No offers to delete"); // Ensure the array is not empty
+        require(offerID < allOffers.length, "Invalid offer ID"); // Ensure the offerID is within bounds
 
         Offer memory offerToDelete = allOffers[offerID];
         require(
@@ -180,58 +229,23 @@ contract ReputationStateMachine {
             "Only the seller or marketplace can delete this offer"
         );
 
-        // Remove the offer by swapping with the last element and popping from the array
-        allOffers[offerID] = allOffers[allOffers.length - 1];
+        // If offerID is not the last element, replace it with the last element
+        if (offerID < allOffers.length - 1) {
+            allOffers[offerID] = allOffers[allOffers.length - 1];
+        }
+
+        // Remove the last element
         allOffers.pop();
 
-        // Also remove it from the seller's specific offer list
-        uint256 length = addressToOffers[offerToDelete.seller].length;
-        for (uint256 i = 0; i < length; i++) {
-            if (
-                keccak256(abi.encodePacked(addressToOffers[offerToDelete.seller][i].item)) ==
-                keccak256(abi.encodePacked(offerToDelete.item)) &&
-                addressToOffers[offerToDelete.seller][i].price == offerToDelete.price
-            ) {
-                addressToOffers[offerToDelete.seller][i] = addressToOffers[offerToDelete.seller][length - 1];
-                addressToOffers[offerToDelete.seller].pop();
-                break;
-            }
-        }
+        emit OfferDeleted(offerID, offerToDelete.seller);
     }
 
 
-    // Function to get all offers
-    function getAllOffers() public view returns (Offer[] memory) {
-        Offer[] memory tempOffers = new Offer[](allOffers.length);
-        uint count = 0;
 
-        if (users[msg.sender].isMarketplace) {
-            // If marketplace, only return offers where buyerAccept is true
-            for (uint i = 0; i < allOffers.length; i++) {
-                if (allOffers[i].buyerAccept) {
-                    tempOffers[count] = allOffers[i];
-                    count++;
-                }
-            }
-        } else {
-            // If user, return offers where buyerAccept is false,
-            // or if the user is the seller
-            for (uint i = 0; i < allOffers.length; i++) {
-                
-                    tempOffers[count] = allOffers[i];
-                    count++;
-                
-            }
-        }
 
-        // Resize the memory array to fit the actual count
-        Offer[] memory filteredOffers = new Offer[](count);
-        for (uint i = 0; i < count; i++) {
-            filteredOffers[i] = tempOffers[i];
-        }
 
-        return filteredOffers;
-    }
+
+  
 
     /******************************************************************** */
     /*                                                                    */
