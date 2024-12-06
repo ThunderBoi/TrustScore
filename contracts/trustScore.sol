@@ -3,34 +3,32 @@ pragma solidity ^0.8.0;
 
 contract ReputationStateMachine {
 
-    function test() public pure returns (uint256) {
-        return 1;
-    }
-
     /******************************************************************** */
     /*                                                                    */
     /*                              States                                */
     /*                                                                    */
     /******************************************************************** */
-    // States of the transaction
-    enum State { Pending, Shipping, Delivered, Cancelled }
-
-    event DebugUser(bool exists, address user);
-
-    event OfferDeleted(uint256 offerID, address seller);
-
-    event DebugOfferDeletion(uint256 offerID, uint256 allOffersLength);
-
-
     // Delivery states
-    enum DeliveryState { Shipped, NotShippedMissingData, NotShippedDeliveryProblem }
+    enum DeliveryState {NotShipped, Shipped, NotShippedMissingData, NotShippedDeliveryProblem }
+
+
     /******************************************************************** */
     /*                                                                    */
     /*                            Datastructs                             */
     /*                                                                    */
     /******************************************************************** */
+    // Struct to store user profile
+    struct UserProfile {
+        uint256 ratingSum;
+        uint256 ratingCount;
+        bool exists;
+        bool isMarketplace;
+        bool authenticated;
+    }
+
     // Struct to store transaction details
     struct Transaction {
+        uint256 transactionID;
         address buyer;
         address seller;
         address marketplace;
@@ -38,19 +36,15 @@ contract ReputationStateMachine {
         uint256 phase1EndTime; // End of Phase 1
         uint256 phase2EndTime; // End of Phase 2
         uint256 phase3EndTime; // End of Phase 3
-        State currentState;
+        uint256 phaseEndTime; // End of the current phase
+        bool buyerRated; // To ensure rating happens only once per participant
+        bool sellerRated;
+        bool marketplaceRatedByBuyer;
+        bool marketplaceRatedBySeller;        
+        uint256 phase; // 1: Initiated, 2: Shipping, 3: Confirming, 4: Finalized
         DeliveryState deliveryState;
         bool finalized; // True if transaction is completed or cancelled
-        bool rated;
-    }
 
-    // Struct to store user reputation
-    struct UserProfile {
-        uint256 score;
-        bool exists;
-        bool isMarketplace;
-        bool authenticated; //TBD using DID
-        uint256 numberOfRatings;
     }
 
     // Struct to store offer details
@@ -61,7 +55,9 @@ contract ReputationStateMachine {
         string description;
         address seller;
         address buyer;
+        address marketplace;
         bool buyerAccept;
+        bool valid;
     }
 
     /******************************************************************** */
@@ -72,28 +68,24 @@ contract ReputationStateMachine {
     // Mapping to store user reputation by their wallet address
     mapping(address => UserProfile) private users;
 
-    mapping(uint256 => bool) private validOfferIDs;
-
-
     // Array to store all registered user addresses
     address[] private userAddresses;
 
     // Array to store all offers
     Offer[] private allOffers;
 
-    // Mappings
-    mapping(uint256 => Transaction) public transactions; // Map transaction IDs to transactions
-    mapping(address => UserProfile) public reputations; // Map addresses to reputation scores
+    // Array to store all Transactions
+    Transaction[] private allTransactions;
 
-    uint256 public transactionCount;
+
     /******************************************************************** */
     /*                                                                    */
     /*                              EVENTS                                */
     /*                                                                    */
     /******************************************************************** */
     event TransactionInitiated(uint256 transactionId, address buyer, address seller, address marketplace);
-    event PhaseUpdated(uint256 transactionId, State newState);
     event TransactionFinalized(uint256 transactionId, bool success);
+    event TransactionCanceled(uint256 transactionId, address canceledBy); 
     event RatingSubmitted(uint256 transactionId, address rater, uint8 rating, string review);
     event OfferCreated(address indexed seller, string item, uint256 price, string description);
 
@@ -103,28 +95,24 @@ contract ReputationStateMachine {
     /*                            Modifiers                               */
     /*                                                                    */
     /******************************************************************** */
-    // Modifier to check state
-    modifier inState(uint256 transactionId, State requiredState) {
-        require(transactions[transactionId].currentState == requiredState, "Invalid state for this action");
+    modifier inState(uint256 transactionId, uint256 phase) {
+        require(allTransactions[transactionId].phase == phase, "Invalid state");
+        _;
+    }
+    modifier withinTime(uint256 endTime) {
+        require(block.timestamp <= endTime, "Time limit exceeded");
         _;
     }
 
-    // Modifier to check timeframes
-    modifier withinTime(uint256 deadline) {
-        require(block.timestamp <= deadline, "Action is no longer allowed");
-        _;
-    }
 
     /******************************************************************** */
     /*                                                                    */
     /*                            Functions                               */
     /*                                                                    */
     /******************************************************************** */
-
     function registerUser(bool isMarketplace) public {
-        emit DebugUser(users[msg.sender].exists, msg.sender);
         require(!users[msg.sender].exists, "User already registered");
-        users[msg.sender] = UserProfile(0, true, isMarketplace, true, 0);
+        users[msg.sender] = UserProfile(0, 0, true, isMarketplace, true);
         userAddresses.push(msg.sender);
     }
 
@@ -144,7 +132,7 @@ contract ReputationStateMachine {
         UserProfile memory userProfile = users[user];
         
         return (
-            userProfile.score,
+            userProfile.ratingCount == 0 ? 0 : userProfile.ratingSum / userProfile.ratingCount,
             userProfile.isMarketplace
         );
     }
@@ -152,10 +140,16 @@ contract ReputationStateMachine {
     // Retrieve the TrustScore of the user
     function getUserScore(address userAddress) public view returns (uint256) {
         require(users[userAddress].exists, "User does not exist");
-        return users[userAddress].score;
+        return users[userAddress].ratingSum;
     }
 
-    
+    // Utility function to get average rating
+    function getAverageRating(address user) public view returns (uint256) {
+        UserProfile memory profile = users[user];
+        require(profile.exists, "User does not exist");
+        return profile.ratingCount > 0 ? profile.ratingSum / profile.ratingCount : 0;
+    }
+
     // Function to get all offers
     function getFilteredOffers() public view returns (Offer[] memory) {
         uint count = 0;
@@ -163,21 +157,29 @@ contract ReputationStateMachine {
         // Create a temporary array to hold filtered offers
         Offer[] memory tempOffers = new Offer[](allOffers.length);
 
-        if (users[msg.sender].isMarketplace) {
-            // For marketplaces, return offers where buyerAccept is true
-            for (uint i = 0; i < allOffers.length; i++) {
-                if (allOffers[i].buyerAccept) {
-                    tempOffers[count] = allOffers[i];
-                    count++;
+        /*         if (users[msg.sender].isMarketplace) {
+                // For marketplaces, return offers where buyerAccept is true
+                for (uint i = 0; i < allOffers.length; i++) {
+                    if (allOffers[i].buyerAccept && allOffers[i].valid) {
+                        tempOffers[count] = allOffers[i];
+                        count++;
+                    }
                 }
-            }
-        } else {
-            // For non-marketplaces, return offers where the caller is the seller or buyerAccept is false
-            for (uint i = 0; i < allOffers.length; i++) {
-                if (allOffers[i].seller == msg.sender || !allOffers[i].buyerAccept) {
-                    tempOffers[count] = allOffers[i];
-                    count++;
+            } else {
+                // For non-marketplaces, return offers where the caller is the seller or buyerAccept is false
+                for (uint i = 0; i < allOffers.length; i++) {
+                    if (allOffers[i].valid) {
+                        tempOffers[count] = allOffers[i];
+                        count++;
+                    }
                 }
+            } 
+        */
+
+        for (uint i = 0; i < allOffers.length; i++) {
+            if (allOffers[i].valid) {
+                tempOffers[count] = allOffers[i];
+                count++;
             }
         }
 
@@ -190,7 +192,9 @@ contract ReputationStateMachine {
         return filteredOffers;
     }
 
-
+    function getOfferCount() public view returns (uint256) {
+        return allOffers.length;
+    }
     // Function to create an offer
     function createOffer(string memory item, uint256 price, string memory description) public {
         require(users[msg.sender].exists, "User must be registered to create an offer");
@@ -203,49 +207,28 @@ contract ReputationStateMachine {
             description: description,
             seller: msg.sender,
             buyer: address(0), // Set buyer to the zero address initially
-            buyerAccept: false
+            marketplace: address(0), // Set marketplace to the zero address initially;
+            buyerAccept: false,
+            valid: true
         });
 
         allOffers.push(newOffer);
         emit OfferCreated(msg.sender, item, price, description);
     }
 
-
     function acceptOffer(uint256 offerID) public {
         require(offerID < allOffers.length, "Invalid offer ID");
-        Offer storage offerToAccept = allOffers[offerID];
-        offerToAccept.buyerAccept = true;
-        offerToAccept.buyer = msg.sender;
+        allOffers[offerID].buyerAccept = true;
+        allOffers[offerID].buyer = msg.sender;
     }
-
 
     function deleteOffer(uint256 offerID) public {
         require(allOffers.length > 0, "No offers to delete"); // Ensure the array is not empty
         require(offerID < allOffers.length, "Invalid offer ID"); // Ensure the offerID is within bounds
 
-        Offer memory offerToDelete = allOffers[offerID];
-        require(
-            msg.sender == offerToDelete.seller || users[msg.sender].isMarketplace,
-            "Only the seller or marketplace can delete this offer"
-        );
-
-        // If offerID is not the last element, replace it with the last element
-        if (offerID < allOffers.length - 1) {
-            allOffers[offerID] = allOffers[allOffers.length - 1];
-        }
-
-        // Remove the last element
-        allOffers.pop();
-
-        emit OfferDeleted(offerID, offerToDelete.seller);
+        allOffers[offerID].valid = false;
     }
 
-
-
-
-
-
-  
 
     /******************************************************************** */
     /*                                                                    */
@@ -257,118 +240,185 @@ contract ReputationStateMachine {
         // Check that the caller is a registered marketplace
         require(users[msg.sender].exists && users[msg.sender].isMarketplace, "Only a marketplace can initiate a transaction");
 
-        // Increment the transaction count and create a new transaction ID
-        transactionCount++;
-        uint256 transactionId = transactionCount;
-
         // Create the new transaction
-        transactions[transactionId] = Transaction({
+        Transaction memory transaction = Transaction({
+            transactionID: offerID,
             buyer: buyer,
             seller: seller,
             marketplace: msg.sender,
             startTime: block.timestamp,
             phase1EndTime: block.timestamp + 8 days,
             phase2EndTime: 0,
-            phase3EndTime: 0,
-            currentState: State.Pending,
-            deliveryState: DeliveryState.Shipped,
-            finalized: false,
-            rated: false
+            phase3EndTime: 14,
+            phaseEndTime: block.timestamp + 8 days, // Deadline for the current phase
+            deliveryState: DeliveryState.NotShipped,
+            buyerRated: false,
+            sellerRated: false,
+            marketplaceRatedByBuyer: false,
+            marketplaceRatedBySeller: false,
+
+            phase: 1,
+            finalized: false
         });
 
+        allTransactions.push(transaction);
+        
         // Delete the offer associated with the offerID
-        deleteOffer(offerID);
+        allOffers[offerID].valid = false;
 
         // Emit the TransactionInitiated event
-        emit TransactionInitiated(transactionId, buyer, seller, msg.sender);
+        emit TransactionInitiated(transaction.transactionID, buyer, seller, msg.sender);
     }
 
 
     // Phase 2: Marketplace confirms shipping (seller needs to send shippingID to marketplace in real world scenario)
     function confirmShipping(uint256 transactionId, uint256 phase2Duration)
         public
-        inState(transactionId, State.Pending)
-        withinTime(transactions[transactionId].phase1EndTime)
+        inState(transactionId, 1)
+        withinTime(allTransactions[transactionId].phase1EndTime)
     {
-        require(msg.sender == transactions[transactionId].marketplace, "Only marketplace can confirm shipping initiation");
-        transactions[transactionId].currentState = State.Shipping;
-        transactions[transactionId].phase2EndTime = block.timestamp + phase2Duration;
-
-        emit PhaseUpdated(transactionId, State.Shipping);
+        require(msg.sender == allTransactions[transactionId].marketplace, "Only marketplace can confirm shipping initiation");
+        allTransactions[transactionId].phase = 2;
+        allTransactions[transactionId].phase2EndTime = block.timestamp + phase2Duration;
+        allTransactions[transactionId].deliveryState == DeliveryState.NotShippedMissingData;
     }
 
-    // Phase 3: Marketplace provides final shipping state
-    function updateDeliveryState(uint256 transactionId, DeliveryState deliveryState, uint256 phase3Duration)
+    //Function to update the delivery state and initiate the next phase
+    function updateDeliveryState(uint256 transactionId, DeliveryState deliveryState)
         public
-        inState(transactionId, State.Shipping)
-    {
-        require(msg.sender == transactions[transactionId].marketplace, "Only marketplace can update delivery state");
-        transactions[transactionId].deliveryState = deliveryState;
-        transactions[transactionId].currentState = State.Delivered;
-        transactions[transactionId].phase3EndTime = block.timestamp + phase3Duration;
+        inState(transactionId, 2)
+        withinTime(allTransactions[transactionId].phase2EndTime)
 
-        emit PhaseUpdated(transactionId, State.Delivered);
+    {
+        require(msg.sender == allTransactions[transactionId].marketplace, "Only marketplace can update delivery state");
+        allTransactions[transactionId].deliveryState = deliveryState;
+
+        if (deliveryState == DeliveryState.NotShippedDeliveryProblem) {
+            cancelTransaction(transactionId);
+        }else{
+            allTransactions[transactionId].deliveryState == DeliveryState.Shipped;
+        }
+
+        allTransactions[transactionId].phase = 3;
+
     }
 
-    // Phase 4: Buyer confirms goods
-    function confirmGoods(uint256 transactionId) 
+    // Phase 3: Rate the transaction
+    function rateTransaction(uint256 transactionId) 
         public 
-        inState(transactionId, State.Delivered) 
-        withinTime(transactions[transactionId].phase3EndTime) 
+        inState(transactionId, 3) 
+        withinTime(allTransactions[transactionId].phase3EndTime) 
     {
-        require(msg.sender == transactions[transactionId].buyer, "Only buyer can confirm goods");
-        transactions[transactionId].finalized = true;
+        require(msg.sender == allTransactions[transactionId].buyer || msg.sender == allTransactions[transactionId].seller, "Only buyer or seller can rate transaction");
+
+        allTransactions[transactionId].finalized = true;
 
         emit TransactionFinalized(transactionId, true);
     }
 
-    // Submit rating and review
-    function submitRating(uint256 transactionId, uint8 rating, string calldata review) public {
-        require(transactions[transactionId].finalized, "Transaction not finalized");
-        require(!transactions[transactionId].rated, "Transaction already rated");
-        require(rating >= 1 && rating <= 5, "Rating must be between 1 and 5");
+    //Finalize Transaction
+    function finalizeTransaction() public {
+        for(uint i = 0; i < allTransactions.length; i++){
+            if(allTransactions[i].phase == 3 && allTransactions[i].buyerRated && allTransactions[i].sellerRated){
+                allTransactions[i].finalized = true;
+            }   
+        }
+    }
 
-        Transaction storage txn = transactions[transactionId];
+/*     // Function to get the current phase/state of a transaction
+    function getTransactionPhase(uint256 transactionId) public view returns (uint256) {
+        require(allTransactions[transactionId].buyer != address(0), "Transaction does not exist");
+        return allTransactions[transactionId].phase;
+    }
+ */
+    function getAllTransactions() public view returns (Transaction[] memory) {
+        return allTransactions;
+    }
+
+
+    // Function to rate another participant
+    function rateParticipant(uint256 transactionId, uint8 ratingParticipant, uint8 ratingMarketplace) public {
+        require(ratingParticipant >= 1 && ratingParticipant <= 10, "Rating must be between 1 and 10");
+        require(ratingMarketplace >= 1 && ratingMarketplace <= 10, "Rating must be between 1 and 10");
+        Transaction storage txn = allTransactions[transactionId];
+        require(txn.phase == 3, "Transaction not ratable yet");
+        require(
+            msg.sender == txn.buyer || msg.sender == txn.seller,
+            "Only participants can rate"
+        );
+        require(users[msg.sender].exists, "Participant not registered");
+
         if (msg.sender == txn.buyer) {
-            reputations[txn.seller].score += rating;
-            reputations[txn.seller].numberOfRatings++;
+            require(!txn.buyerRated, "Buyer already rated");
+            users[allTransactions[transactionId].seller].ratingSum += ratingParticipant;
+            users[allTransactions[transactionId].seller].ratingCount++;
+
+            users[txn.marketplace].ratingSum += ratingMarketplace;
+            users[txn.marketplace].ratingCount++;
+
+            txn.buyerRated = true;
+            txn.marketplaceRatedByBuyer = true;
+
+
         } else if (msg.sender == txn.seller) {
-            reputations[txn.buyer].score += rating;
-            reputations[txn.buyer].numberOfRatings++;
-        } else {
-            revert("Only buyer or seller can submit rating");
+            require(!txn.sellerRated, "Seller already rated");
+            users[allTransactions[transactionId].buyer].ratingSum += ratingParticipant;
+            users[allTransactions[transactionId].buyer].ratingCount++;      
+
+            users[txn.marketplace].ratingSum += ratingMarketplace;
+            users[txn.marketplace].ratingCount++;      
+
+            txn.sellerRated = true;
+            txn.marketplaceRatedBySeller = true;
         }
 
-        txn.rated = true;
-        emit RatingSubmitted(transactionId, msg.sender, rating, review);
+    }
+
+    // Function to check if the current phase has expired
+    function cancelTransactionsIfElapsed() public {
+        for (uint i = 0; i < allTransactions.length; i++) {
+            if (allTransactions[i].finalized && block.timestamp > allTransactions[i].phaseEndTime) {
+                cancelTransaction(allTransactions[i].transactionID); // Automatically cancels transactions which expired a phase
+            }
+        }
     }
 
     // Cancel a transaction
     function cancelTransaction(uint256 transactionId) public {
-        Transaction storage txn = transactions[transactionId];
-        txn.currentState = State.Cancelled;
-        txn.finalized = true;
+        require(!allTransactions[transactionId].finalized, "Transaction already canceled or finalized");
 
-        emit TransactionFinalized(transactionId, false);
+         // 1: Initiated, 2: Shipping, 3: Confirming, 4: Finalizing
+        if(allTransactions[transactionId].phase == 1) { 
+        
+
+        }else if(allTransactions[transactionId].phase == 2) { 
+
+
+        }else if(allTransactions[transactionId].phase == 3) {
+
+
+        }
+        
+        allTransactions[transactionId].finalized = true;
     }
 
-    // Function to get the current phase/state of a transaction
-    function getTransactionPhase(uint256 transactionId) public view returns (string memory) {
-    require(transactions[transactionId].buyer != address(0), "Transaction does not exist");
-    
-    State currentState = transactions[transactionId].currentState;
-    if (currentState == State.Pending) {
-        return "Pending";
-    } else if (currentState == State.Shipping) {
-        return "Shipping";
-    } else if (currentState == State.Delivered) {
-        return "Delivered";
-    } else if (currentState == State.Cancelled) {
-        return "Cancelled";
-    } else {
-        return "Unknown";
+/*     function checkUpkeep(bytes calldata) external view returns (bool upkeepNeeded, bytes memory) {
+        upkeepNeeded = false;
+        for (uint256 i = 0; i < allTransactions.length; i++) {
+            if (allTransactions[i].finalized && block.timestamp > allTransactions[i].phase) {
+                upkeepNeeded = true;
+                break;
+            }
+        }
     }
-    }
+
+    function performUpkeep(bytes calldata) external {
+        for (uint256 i = 0; i < allTransactions.length(); i++) {
+            if (allTransactions[i].active && block.timestamp > allTransactions[i].phaseEndTime) {
+                cancelTransaction(i); // Automatically cancels expired transactions
+            }
+        }
+    } */
 
 }
  
