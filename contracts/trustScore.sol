@@ -1,3 +1,55 @@
+/**
+ * @title TrustScore
+ * @dev A smart contract to manage user reputation and transactions in a marketplace.
+ * 
+ * This contract allows users to register, create offers, initiate transactions, and rate participants.
+ * It includes a state machine to manage the different phases of a transaction.
+ * 
+ * States:
+ * - DeliveryState: Enum representing different delivery states.
+ * 
+ * Data Structures:
+ * - UserProfile: Struct to store user profile information.
+ * - Transaction: Struct to store transaction details.
+ * - Offer: Struct to store offer details.
+ * 
+ * Mappings & DataLists:
+ * - users: Mapping to store user reputation by their wallet address.
+ * - userAddresses: Array to store all registered user addresses.
+ * - allOffers: Array to store all offers.
+ * - allTransactions: Array to store all transactions.
+ * 
+ * Events:
+ * - TransactionInitiated: Emitted when a transaction is initiated.
+ * - TransactionFinalized: Emitted when a transaction is finalized.
+ * - TransactionCanceled: Emitted when a transaction is canceled.
+ * - RatingSubmitted: Emitted when a rating is submitted.
+ * - OfferCreated: Emitted when an offer is created.
+ * 
+ * Modifiers:
+ * - inState: Ensures the transaction is in the specified phase.
+ * - withinTime: Ensures the current time is within the specified end time.
+ * 
+ * Functions:
+ * - registerUser: Registers a new user.
+ * - isUserRegistered: Checks if a user is registered.
+ * - getAllUsers: Returns all registered users with their profiles and addresses.
+ * - getUserProfile: Returns the profile of a specific user by address.
+ * - getFilteredOffers: Returns all valid offers.
+ * - getOfferCount: Returns the total number of offers.
+ * - createOffer: Creates a new offer.
+ * - acceptOffer: Accepts an offer.
+ * - deleteOffer: Deletes an offer.
+ * - initiateTransaction: Initiates a new transaction (Phase 1).
+ * - confirmShipping: Confirms shipping initiation (Phase 2).
+ * - updateDeliveryState: Updates the delivery state and initiates the next phase.
+ * - rateTransaction: Rates the transaction (Phase 3).
+ * - finalizeTransaction: Finalizes transactions that have been rated by both participants.
+ * - getAllTransactions: Returns all non-finalized transactions.
+ * - rateParticipant: Rates another participant in a transaction.
+ * - cancelTransactionsIfElapsed: Cancels transactions if the current phase has expired.
+ * - cancelTransaction: Cancels a transaction.
+ */
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
@@ -9,7 +61,7 @@ contract ReputationStateMachine {
     /*                                                                    */
     /******************************************************************** */
     // Delivery states
-    enum DeliveryState {NotShipped, Shipped, NotShippedMissingData, NotShippedDeliveryProblem }
+    enum DeliveryState { NotShipped, Shipped, NotShippedMissingData, NotShippedDeliveryProblem }
 
 
     /******************************************************************** */
@@ -110,14 +162,11 @@ contract ReputationStateMachine {
     /*                            Functions                               */
     /*                                                                    */
     /******************************************************************** */
+    // Function to register a new user
     function registerUser(bool isMarketplace) public {
         require(!users[msg.sender].exists, "User already registered");
         users[msg.sender] = UserProfile(0, 0, true, isMarketplace, true);
         userAddresses.push(msg.sender);
-    }
-
-    function isUserRegistered(address user) public view returns (bool) {
-        return users[user].exists;
     }
 
     // Temporary struct to include user address with their profile
@@ -161,7 +210,6 @@ contract ReputationStateMachine {
         return userProfile;
     }
 
-
     // Function to get all offers
     function getFilteredOffers() public view returns (Offer[] memory) {
         uint count = 0;
@@ -204,6 +252,7 @@ contract ReputationStateMachine {
         return filteredOffers;
     }
 
+    // Function to get the total number of offers
     function getOfferCount() public view returns (uint256) {
         return allOffers.length;
     }
@@ -228,12 +277,14 @@ contract ReputationStateMachine {
         emit OfferCreated(msg.sender, item, price, description);
     }
 
+    // Function to accept an offer
     function acceptOffer(uint256 offerID) public {
         require(offerID < allOffers.length, "Invalid offer ID");
         allOffers[offerID].buyerAccept = true;
         allOffers[offerID].buyer = msg.sender;
     }
 
+    //Function to delete an offer
     function deleteOffer(uint256 offerID) public {
         require(allOffers.length > 0, "No offers to delete"); // Ensure the array is not empty
         require(offerID < allOffers.length, "Invalid offer ID"); // Ensure the offerID is within bounds
@@ -337,12 +388,7 @@ contract ReputationStateMachine {
         }
     }
 
-/*     // Function to get the current phase/state of a transaction
-    function getTransactionPhase(uint256 transactionId) public view returns (uint256) {
-        require(allTransactions[transactionId].buyer != address(0), "Transaction does not exist");
-        return allTransactions[transactionId].phase;
-    }
- */
+    // Function to get all non-finalized transactions
     function getAllTransactions() public view returns (Transaction[] memory) {
         uint256 count = 0;
 
@@ -367,8 +413,6 @@ contract ReputationStateMachine {
 
         return filteredTransactions;
     }
-
-
 
     // Function to rate another participant
     function rateParticipant(uint256 transactionId, uint8 ratingParticipant, uint8 ratingMarketplace) public {
@@ -420,41 +464,41 @@ contract ReputationStateMachine {
     // Cancel a transaction
     function cancelTransaction(uint256 transactionId) public {
         require(!allTransactions[transactionId].finalized, "Transaction already canceled or finalized");
-
-         // 1: Initiated, 2: Shipping, 3: Confirming, 4: Finalizing
-        if(allTransactions[transactionId].phase == 1) { 
-        
-
-        }else if(allTransactions[transactionId].phase == 2) { 
-
-
-        }else if(allTransactions[transactionId].phase == 3) {
-
-
-        }
-        
         allTransactions[transactionId].finalized = true;
     }
 
 
+    /*
+        These functions automate transaction management using Chainlink Keepers:
 
-/*     function checkUpkeep(bytes calldata) external view returns (bool upkeepNeeded, bytes memory) {
-        upkeepNeeded = false;
-        for (uint256 i = 0; i < allTransactions.length; i++) {
-            if (allTransactions[i].finalized && block.timestamp > allTransactions[i].phase) {
-                upkeepNeeded = true;
-                break;
+        1. checkUpkeep(bytes calldata):
+        - Periodically checks if any transaction has exceeded its phase time.
+        - Sets `upkeepNeeded` to `true` if a finalized transaction is found with `block.timestamp > phase`.
+
+        2. performUpkeep(bytes calldata):
+        - Cancels transactions that are active and have exceeded their `phaseEndTime`.
+        - Calls `cancelTransaction(i)` for each expired transaction.
+
+        Purpose:
+        - Automatically cancels expired transactions, ensuring efficient contract maintenance without manual intervention.
+    */
+    /*     function checkUpkeep(bytes calldata) external view returns (bool upkeepNeeded, bytes memory) {
+            upkeepNeeded = false;
+            for (uint256 i = 0; i < allTransactions.length; i++) {
+                if (allTransactions[i].finalized && block.timestamp > allTransactions[i].phase) {
+                    upkeepNeeded = true;
+                    break;
+                }
             }
         }
+
+        function performUpkeep(bytes calldata) external {
+            for (uint256 i = 0; i < allTransactions.length(); i++) {
+                if (allTransactions[i].active && block.timestamp > allTransactions[i].phaseEndTime) {
+                    cancelTransaction(i); // Automatically cancels expired transactions
+                }
+            }
+        } */
+
     }
-
-    function performUpkeep(bytes calldata) external {
-        for (uint256 i = 0; i < allTransactions.length(); i++) {
-            if (allTransactions[i].active && block.timestamp > allTransactions[i].phaseEndTime) {
-                cancelTransaction(i); // Automatically cancels expired transactions
-            }
-        }
-    } */
-
-}
  
