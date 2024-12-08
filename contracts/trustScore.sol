@@ -120,35 +120,47 @@ contract ReputationStateMachine {
         return users[user].exists;
     }
 
-    // Function to get the full list of registered users
-    function getAllUsers() public view returns (address[] memory) {
-        return userAddresses;
+    // Temporary struct to include user address with their profile
+    struct UserWithAddress {
+        address userAddress;
+        uint256 ratingSum;
+        uint256 ratingCount;
+        bool exists;
+        bool isMarketplace;
+        bool authenticated;
+    }
+
+    // Function to get all registered users with their profiles and addresses
+    function getAllUsers() public view returns (UserWithAddress[] memory) {
+        uint256 totalUsers = userAddresses.length;
+        UserWithAddress[] memory usersWithAddresses = new UserWithAddress[](totalUsers);
+
+        for (uint256 i = 0; i < totalUsers; i++) {
+            address userAddress = userAddresses[i];
+            UserProfile memory profile = getUserProfile(userAddress);
+
+            usersWithAddresses[i] = UserWithAddress({
+                userAddress: userAddress,
+                ratingSum: profile.ratingSum,
+                ratingCount: profile.ratingCount,
+                exists: profile.exists,
+                isMarketplace: profile.isMarketplace,
+                authenticated: profile.authenticated
+            });
+        }
+
+        return usersWithAddresses;
     }
 
     // Function to get the profile of a specific user by address
-    function getUserProfile(address user) public view returns (uint256, bool) {
+    function getUserProfile(address user) public view returns (UserProfile memory) {
         require(users[user].exists, "User does not exist");
         
         UserProfile memory userProfile = users[user];
         
-        return (
-            userProfile.ratingCount == 0 ? 0 : userProfile.ratingSum / userProfile.ratingCount,
-            userProfile.isMarketplace
-        );
+        return userProfile;
     }
 
-    // Retrieve the TrustScore of the user
-    function getUserScore(address userAddress) public view returns (uint256) {
-        require(users[userAddress].exists, "User does not exist");
-        return users[userAddress].ratingSum;
-    }
-
-    // Utility function to get average rating
-    function getAverageRating(address user) public view returns (uint256) {
-        UserProfile memory profile = users[user];
-        require(profile.exists, "User does not exist");
-        return profile.ratingCount > 0 ? profile.ratingSum / profile.ratingCount : 0;
-    }
 
     // Function to get all offers
     function getFilteredOffers() public view returns (Offer[] memory) {
@@ -332,8 +344,30 @@ contract ReputationStateMachine {
     }
  */
     function getAllTransactions() public view returns (Transaction[] memory) {
-        return allTransactions;
+        uint256 count = 0;
+
+        // First, count the number of non-finalized transactions
+        for (uint256 i = 0; i < allTransactions.length; i++) {
+            if (!allTransactions[i].finalized) {
+                count++;
+            }
+        }
+
+        // Create a new array with the correct size
+        Transaction[] memory filteredTransactions = new Transaction[](count);
+        uint256 index = 0;
+
+        // Populate the new array with non-finalized transactions
+        for (uint256 i = 0; i < allTransactions.length; i++) {
+            if (!allTransactions[i].finalized) {
+                filteredTransactions[index] = allTransactions[i];
+                index++;
+            }
+        }
+
+        return filteredTransactions;
     }
+
 
 
     // Function to rate another participant
@@ -401,6 +435,8 @@ contract ReputationStateMachine {
         
         allTransactions[transactionId].finalized = true;
     }
+
+
 
 /*     function checkUpkeep(bytes calldata) external view returns (bool upkeepNeeded, bytes memory) {
         upkeepNeeded = false;
